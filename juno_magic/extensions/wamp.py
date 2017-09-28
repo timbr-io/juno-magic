@@ -20,11 +20,14 @@ import os
 import sys
 import shlex
 import json
-from time import sleep
+import time
 from collections import defaultdict
 
-if sys.version.startswith("3"):
+if sys.version_info >= (3, 0):
     unicode = str
+    import queue as Queue
+else:
+    import Queue
 
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 from autobahn.twisted.websocket import WampWebSocketClientProtocol
@@ -47,6 +50,7 @@ import re
 from juno_magic.exception import *
 
 from jupyter_react import Component
+import signal
 
 JUNO_KERNEL_URI = os.environ.get("JUNO_KERNEL_URI", "https://juno.timbr.io/juno/api/kernels/list")
 
@@ -54,6 +58,7 @@ MAX_MESSAGE_PAYLOAD_SIZE = 0
 MAX_FRAME_PAYLOAD_SIZE = 0
 
 status_msg_cache = defaultdict(Deferred)
+cache_pending = lambda x: status_msg_cache[x]
 clean_status_cache = lambda x: status_msg_cache.__delitem__(x)
 
 def publish_to_display(obj):
@@ -262,7 +267,6 @@ def get_connection_error(proto):
             return MaxMessagePayloadSizeExceededError(proto.wasNotCleanReason)
         elif proto.wasNotCleanReason is not None:
             return ConnectError(proto.wasNotCleanReason)
-
     return None
 
 def get_session_info(proto):
@@ -273,6 +277,7 @@ def get_session_info(proto):
                             "failed_by_me": proto.failedByMe}
            }
     return msg
+
 
 @magics_class
 class JunoMagics(Magics):
@@ -291,6 +296,7 @@ class JunoMagics(Magics):
         self._hb_interval = 5
         self._heartbeat = LoopingCall(self._ping)
         self._debug = True
+        self._queue = Queue.Queue()
         self._wamp_err_handler = WampErrorDispatcher(self)
 
         if self._debug:
@@ -314,7 +320,7 @@ class JunoMagics(Magics):
             if token is None:
                 token = self._token
             self._sp = wampify(self._connection_file, "--wamp-url", wamp_url, "--token", token, _bg=True)
-            sleep(1)
+            time.sleep(1)
             if self._sp.process.is_alive():
                 print("Bridge Running")
             else:
@@ -366,10 +372,12 @@ class JunoMagics(Magics):
         execute_parser = subparsers.add_parser("execute", help="Evaluate code on remote kernel")
         execute_parser.add_argument("prefix", help="Prefix for accessing the remote kernel", nargs="?")
         execute_parser.set_defaults(fn=self.execute)
+
         return parser
 
     @line_cell_magic
     def juno(self, line, cell=None):
+        log.msg("juno called")
         _block = False
         try:
             input_args = shlex.split(line)
@@ -377,15 +385,32 @@ class JunoMagics(Magics):
                 input_args.insert(0, "execute")
                 _block = True
             args, extra = self._parser.parse_known_args(input_args)
+
             if _block:
-                result = threads.blockingCallFromThread(reactor, args.fn, cell=cell, **vars(args))
-                return result
+                log.msg("starting blocking execute")
+                try:
+                    log.msg("CALLED: juno {}".format(args))
+                    d = args.fn(cell=cell, **vars(args))
+                    d.addCallback(cache_pending)
+                    d.addCallback(self._queue.put)
+                    while True:
+                        log.msg("in get loop")
+                        try:
+                            return self._queue.get(block=False)
+                        except Queue.Empty:
+                            time.sleep(0.1)
+                except KeyboardInterrupt:
+                    for msg_id in status_msg_cache:
+                        clean_msg_cache(msg_id)
+                    return None
             else:
                 result = args.fn(cell=cell, **vars(args))
+                log.msg("starting non-blocking call")
                 if isinstance(result, Deferred):
                     result.addCallback(lambda x: publish_to_display(x) if x is not None else "[muted]")
                 else:
                     return result
+
         except SystemExit:
             pass
 
@@ -472,6 +497,7 @@ class JunoMagics(Magics):
             yield self.set_connection(None)
 
         if self._ready_to_connect:
+            log.msg("making new connection!")
             self._connected = Deferred() # allocate a new deferred
             self._router_url = wamp_url
             _wamp_application_runner = ApplicationRunner(url=unicode(self._router_url), realm=unicode(self._realm), headers={"Authorization": "Bearer {}".format(self._token)})
@@ -565,8 +591,7 @@ class JunoMagics(Magics):
             output = yield self._wamp.call(".".join([prefix, "execute"]), cell)
         else:
             output = yield self._wamp.call(".".join([self._kernel_prefix, "execute"]), cell)
-        yield status_msg_cache[output]
-
+        returnValue(output)
 
     @inlineCallbacks
     def _ping(self):
